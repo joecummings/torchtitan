@@ -1,0 +1,77 @@
+# torchtitan Config.toml for Qwen3 VL 32B
+
+[job]
+dump_folder = "./outputs"
+description = "Qwen3 VL 32B training"
+print_config = false
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+enable_memory_snapshot = false
+save_memory_snapshot_folder = "memory_snapshot"
+
+[metrics]
+log_freq = 10
+disable_color_printing = false
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = false
+
+[model]
+name = "qwen3_vl"
+flavor = "32B"
+# Path to HuggingFace Qwen3-VL-32B assets (tokenizer, config)
+# hf_assets_path = "/path/to/Qwen3-VL-32B"
+
+[optimizer]
+name = "AdamW"
+lr = 1e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 2000  # lr scheduler warm up
+decay_ratio = 0.8  # lr scheduler decay ratio
+decay_type = "cosine"
+min_lr_factor = 0.1
+
+[training]
+local_batch_size = 1
+seq_len = 4096
+max_norm = 1.0  # grad norm clipping
+steps = 100000
+dataset = "cc12m"
+# dataset_path = "/path/to/dataset"  # Optional custom dataset path
+
+[data]
+max_patches_per_image = 4096  # Supports high-resolution images
+max_images_per_batch = 8
+patch_size = 16
+spatial_merge_size = 2
+packing_buffer_size = 100  # Enable sample packing
+
+[compile]
+enable = true
+components = ["model"]
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1  # Use all available GPUs for FSDP
+fsdp_reshard_after_forward = "default"
+tensor_parallel_degree = 1  # TP not yet supported for VLM
+enable_async_tensor_parallel = false
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+interval = 1000
+last_save_model_only = false
+export_dtype = "bfloat16"
+async_mode = "async"
+
+[activation_checkpoint]
+mode = "selective"  # ["none", "selective", "full"]
+selective_ac_option = '2'  # ac every 2 layers
