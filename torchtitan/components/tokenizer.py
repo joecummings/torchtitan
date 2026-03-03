@@ -95,7 +95,7 @@ class HuggingFaceTokenizer(BaseTokenizer):
     def _load_tokenizer_from_path(self, tokenizer_path: str) -> Tokenizer:
         """Load tokenizer from various file formats."""
         if not os.path.exists(tokenizer_path):
-            if "assets/tokenizer" in tokenizer_path:
+            if "assets/tokenizer" in tokenizer_path and "tests/" not in tokenizer_path:
                 raise FileNotFoundError(
                     "Detected ./assets/tokenizer path which was deprecated in https://github.com/pytorch/torchtitan/pull/1540.\n"
                     "Remove --model.tokenizer_path and download to --model.hf_assets_path using ./scripts/download_hf_assets.py\n"
