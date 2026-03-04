@@ -219,13 +219,8 @@ class PolicyTrainer(Actor, Configurable):
         """
         titan_state = self.model.state_dict()
 
-        # Unwrap DTensors to plain local tensors and clone to break shared storage.
-        # Without clone, to_local() returns a view of the trainer's parameter data.
-        # Since trainer and generator are collocated (same process), Monarch passes
-        # by reference, so the generator's set_model_state_dict can corrupt the
-        # trainer's Replicate params (norm weights) via in-place redistribution.
         return {
-            k: v.to_local().clone() if isinstance(v, DTensor) else v.clone()
+            k: v.full_tensor() if isinstance(v, DTensor) else v
             for k, v in titan_state.items()
         }
 
