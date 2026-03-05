@@ -44,11 +44,14 @@ logger = logging.getLogger(__name__)
 
 
 class Provisioner:
-    """Allocates non-overlapping GPU ranges from a fixed pool.
+    """Allocates non-overlapping GPU ranges for Monarch proc meshes.
 
-    Each call to `allocate` reserves the next contiguous block and
-    returns a bootstrap function that sets ``CUDA_VISIBLE_DEVICES`` before
-    CUDA initializes in the spawned process.
+    In non-colocated mode, the trainer and generator run on separate GPU
+    meshes (e.g. GPUs 0-3 for training, GPUs 4-7 for generation). Each
+    call to ``allocate(n)`` reserves the next *n* GPUs and returns a
+    bootstrap callable that sets ``CUDA_VISIBLE_DEVICES`` before CUDA
+    initializes in the spawned process, ensuring each mesh only sees its
+    own devices.
     """
 
     def __init__(self, total_gpus: int = 8):
@@ -123,6 +126,18 @@ class RLTrainer(Configurable):
 
         self.task = SumDigitsTask(seed=42)
 
+    @staticmethod
+    def _compute_world_size(p: "ParallelismConfig") -> int:
+        """Compute world size from all parallel dimensions."""
+        dp_shard = max(p.data_parallel_shard_degree, 1)
+        return (
+            p.data_parallel_replicate_degree
+            * dp_shard
+            * p.tensor_parallel_degree
+            * p.pipeline_parallel_degree
+            * p.context_parallel_degree
+        )
+
     async def setup(self):
         """Spawn Monarch actors on separate meshes and initialize weights.
 
@@ -132,13 +147,9 @@ class RLTrainer(Configurable):
         """
         config = self.config
 
-        self.trainer_world_size = (
-            config.trainer.parallelism.data_parallel_replicate_degree
-            * config.trainer.parallelism.tensor_parallel_degree
-        )
-        self.generator_world_size = (
-            config.generator.parallelism.data_parallel_replicate_degree
-            * config.generator.parallelism.tensor_parallel_degree
+        self.trainer_world_size = self._compute_world_size(config.trainer.parallelism)
+        self.generator_world_size = self._compute_world_size(
+            config.generator.parallelism
         )
 
         total_gpus = self.trainer_world_size + self.generator_world_size
