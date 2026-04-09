@@ -36,16 +36,85 @@ import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
-from torchtitan.config import Configurable
+from torchtitan.config import Configurable, ParallelismConfig
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.grader import Grader
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.actors.utils import extract_response_logprobs
 from torchtitan.experiments.rl.sum_digits import extract_answer, SumDigitsTask
-from torchtitan.experiments.rl.types import Episode
+from torchtitan.experiments.rl.types import Episode, TrainBatch
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+
+class VarlenGRPOLoss:
+    """Clipped GRPO loss for packed varlen sequences.
+
+    Extracts per-sample response logprobs from packed ``[1, total_tokens]``
+    tensors using sequence offsets, then computes the standard clipped
+    surrogate objective with an optional KL penalty.
+
+    # TODO: Factor out the core loss math into a base class so a padded
+    # GRPOLoss variant (for SDPA / non-varlen backends) can reuse it.
+    """
+
+    def __init__(
+        self,
+        kl_coef: float = 0.0,
+        clip_eps: float = 0.2,
+    ):
+        self.kl_coef = kl_coef
+        self.clip_eps = clip_eps
+
+    def __call__(
+        self,
+        policy_logprobs: torch.Tensor,
+        ref_logprobs: torch.Tensor,
+        advantages: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        response_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        policy_per_sample = extract_response_logprobs(
+            policy_logprobs, seq_lens, prompt_lens, response_lens
+        )
+        ref_per_sample = extract_response_logprobs(
+            ref_logprobs, seq_lens, prompt_lens, response_lens
+        )
+
+        per_sample_mean_log_ratio = []
+        per_sample_mean_kl = []
+
+        for policy_lps, ref_lps in zip(policy_per_sample, ref_per_sample):
+            token_log_ratio = policy_lps - ref_lps.detach()
+            per_sample_mean_log_ratio.append(token_log_ratio.mean())
+
+            token_kl = torch.exp(token_log_ratio) - 1 - token_log_ratio
+            per_sample_mean_kl.append(token_kl.mean())
+
+        mean_log_ratio = torch.stack(per_sample_mean_log_ratio)
+        ratio = torch.exp(mean_log_ratio)
+
+        unclipped_loss = ratio * advantages
+        clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+        clipped_loss = clipped_ratio * advantages
+        pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+
+        kl_div = torch.stack(per_sample_mean_kl).mean()
+
+        loss = pg_loss + self.kl_coef * kl_div
+        metrics = {
+            "pg_loss": pg_loss.item(),
+            "kl_div": kl_div.item(),
+            "ratio_mean": ratio.mean().item(),
+            "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6)
+            .float()
+            .mean()
+            .item(),
+        }
+        return loss, metrics
 
 
 class Provisioner:
@@ -187,7 +256,7 @@ class RLTrainer(Configurable):
         return result.item(**kwargs)
 
     @staticmethod
-    def _compute_world_size(p: "ParallelismConfig") -> int:
+    def _compute_world_size(p: ParallelismConfig) -> int:
         """Compute world size from all parallel dimensions."""
         dp_shard = max(p.data_parallel_shard_degree, 1)
         return (
@@ -196,6 +265,38 @@ class RLTrainer(Configurable):
             * p.tensor_parallel_degree
             * p.pipeline_parallel_degree
             * p.context_parallel_degree
+        )
+
+    def _shard_episodes(self, episodes: list[Episode]) -> list[list[Episode]]:
+        return [
+            [episodes[i] for i in range(rank, len(episodes), self.trainer_dp_degree)]
+            for rank in range(self.trainer_dp_degree)
+        ]
+
+    @staticmethod
+    def _collate_episodes(episodes: list[Episode]) -> TrainBatch:
+        all_ids: list[int] = []
+        prompt_lens: list[int] = []
+        response_lens: list[int] = []
+
+        for ep in episodes:
+            all_ids.extend(ep.prompt_token_ids + ep.token_ids)
+            prompt_lens.append(len(ep.prompt_token_ids))
+            response_lens.append(len(ep.token_ids))
+
+        prompt_lens_t = torch.tensor(prompt_lens, dtype=torch.long)
+        response_lens_t = torch.tensor(response_lens, dtype=torch.long)
+
+        return TrainBatch(
+            token_ids=torch.tensor([all_ids], dtype=torch.long),
+            prompt_lens=prompt_lens_t,
+            response_lens=response_lens_t,
+            seq_lens=prompt_lens_t + response_lens_t,
+            advantages=torch.tensor(
+                [ep.advantage for ep in episodes],
+                dtype=torch.float32,
+            ),
+            token_logprobs=[ep.token_log_probs for ep in episodes],
         )
 
     async def setup(
@@ -230,6 +331,9 @@ class RLTrainer(Configurable):
         self.generator_world_size = self._compute_world_size(
             config.generator.parallelism
         )
+        tp = config.trainer.parallelism
+        dp_shard = max(tp.data_parallel_shard_degree, 1)
+        self.trainer_dp_degree = tp.data_parallel_replicate_degree * dp_shard
 
         total_gpus = self.trainer_world_size + self.generator_world_size
         logger.info(
@@ -266,9 +370,6 @@ class RLTrainer(Configurable):
             # world size and number of nodes allocated to that role
             trainer_gpus_per_node = self.trainer_world_size // trainer_nodes
             generator_gpus_per_node = self.generator_world_size // generator_nodes
-
-            trainer_tp = config.trainer.parallelism.tensor_parallel_degree
-            generator_tp = config.generator.parallelism.tensor_parallel_degree
 
             trainer_host_mesh = host_mesh.slice(hosts=slice(0, trainer_nodes))
             generator_host_mesh = host_mesh.slice(
@@ -316,6 +417,7 @@ class RLTrainer(Configurable):
             "trainer",
             PolicyTrainer,
             config.trainer,
+            loss_fn=VarlenGRPOLoss(),
             model_spec=config.model_spec,
             hf_assets_path=config.hf_assets_path,
             transfer_dtype=config.generator.model_dtype,
@@ -453,8 +555,13 @@ class RLTrainer(Configurable):
             if self.config.log_samples:
                 _log_samples(episodes)
 
-            # 4. Trainer updates policy using episodes with advantages
-            metrics = self._get_rank_0_value(self.trainer.step.call(episodes).get())
+            # 4. Trainer updates policy using pre-collated batches
+            maybe_sharded_episodes = self._shard_episodes(episodes)
+            batches = [
+                self._collate_episodes(per_rank_episodes)
+                for per_rank_episodes in maybe_sharded_episodes
+            ]
+            metrics = self._get_rank_0_value(self.trainer.step.call(batches).get())
 
             # 5. Sync weights
             t0 = time.perf_counter()
@@ -470,12 +577,13 @@ class RLTrainer(Configurable):
             avg_len = sum(all_token_lens) / len(all_token_lens)
 
             all_rewards = [ep.reward for ep in episodes]
+            reward_mean = sum(all_rewards) / len(all_rewards)
             correct_count = sum(1 for r in all_rewards if r > 0)
             total_count = len(all_rewards)
 
             logger.info(
                 f"Step {step:2d} | Loss: {metrics['loss']:+.4f} | "
-                f"Reward: {metrics['reward_mean']:+.3f} | "
+                f"Reward: {reward_mean:+.3f} | "
                 f"Correct: {correct_count:>2}/{total_count} | "
                 f"Avg tokens: {avg_len:>3.0f} | "
                 f"Logprob diff: mean={metrics['logprob_diff_mean']:.4e}, "
